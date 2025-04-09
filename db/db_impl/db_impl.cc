@@ -80,6 +80,7 @@
 #include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
+#include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/merge_operator.h"
@@ -3795,6 +3796,16 @@ bool DBImpl::KeyMayExist(const ReadOptions& read_options,
   return s.ok() || s.IsIncomplete();
 }
 
+std::unique_ptr<MultiScan> DBImpl::NewMultiScan(
+    const ReadOptions& _read_options, ColumnFamilyHandle* column_family,
+    const std::vector<ScanOptions>& scan_opts) {
+  std::unique_ptr<Iterator> iter(NewIterator(_read_options, column_family));
+  iter->Prepare(scan_opts);
+  std::unique_ptr<MultiScan> ms_iter =
+      std::make_unique<MultiScan>(scan_opts, std::move(iter));
+  return ms_iter;
+}
+
 Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                               ColumnFamilyHandle* column_family) {
   if (_read_options.io_activity != Env::IOActivity::kUnknown &&
@@ -4407,7 +4418,7 @@ Status DBImpl::GetPropertiesOfTablesInRange(ColumnFamilyHandle* column_family,
   // Add timestamp if needed
   for (size_t i = 0; i < n; i++) {
     auto [start, limit] = MaybeAddTimestampsToRange(
-        &range[i].start, &range[i].limit, ts_sz, &keys.emplace_back(),
+        range[i].start, range[i].limit, ts_sz, &keys.emplace_back(),
         &keys.emplace_back(), /*exclusive_end=*/false);
     assert(start.has_value());
     assert(limit.has_value());
@@ -4415,6 +4426,29 @@ Status DBImpl::GetPropertiesOfTablesInRange(ColumnFamilyHandle* column_family,
   }
   auto s =
       version->GetPropertiesOfTablesInRange(read_options, ukey_ranges, props);
+
+  // Decrement the ref count
+  mutex_.Lock();
+  version->Unref();
+  mutex_.Unlock();
+
+  return s;
+}
+
+Status DBImpl::GetPropertiesOfTablesByLevel(
+    ColumnFamilyHandle* column_family,
+    std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level) {
+  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+  auto cfd = cfh->cfd();
+
+  // Increment the ref count
+  mutex_.Lock();
+  auto version = cfd->current();
+  version->Ref();
+  mutex_.Unlock();
+
+  const ReadOptions read_options;
+  auto s = version->GetPropertiesOfTablesByLevel(read_options, props_by_level);
 
   // Decrement the ref count
   mutex_.Lock();
@@ -4724,7 +4758,7 @@ void DBImpl::GetApproximateMemTableStats(ColumnFamilyHandle* column_family,
   // Add timestamp if needed
   std::string start_with_ts, limit_with_ts;
   auto [start, limit] = MaybeAddTimestampsToRange(
-      &range.start, &range.limit, ts_sz, &start_with_ts, &limit_with_ts);
+      range.start, range.limit, ts_sz, &start_with_ts, &limit_with_ts);
   assert(start.has_value());
   assert(limit.has_value());
   // Convert user_key into a corresponding internal key.
@@ -4762,9 +4796,8 @@ Status DBImpl::GetApproximateSizes(const SizeApproximationOptions& options,
   for (int i = 0; i < n; i++) {
     // Add timestamp if needed
     std::string start_with_ts, limit_with_ts;
-    auto [start, limit] =
-        MaybeAddTimestampsToRange(&range[i].start, &range[i].limit, ts_sz,
-                                  &start_with_ts, &limit_with_ts);
+    auto [start, limit] = MaybeAddTimestampsToRange(
+        range[i].start, range[i].limit, ts_sz, &start_with_ts, &limit_with_ts);
     assert(start.has_value());
     assert(limit.has_value());
     // Convert user_key into a corresponding internal key.
@@ -4840,7 +4873,7 @@ Status DBImpl::GetUpdatesSince(
 }
 
 Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
-                                   const RangePtr* ranges, size_t n,
+                                   const RangeOpt* ranges, size_t n,
                                    bool include_end) {
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
@@ -4852,7 +4885,7 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
   const Comparator* ucmp = cfd->user_comparator();
   assert(ucmp);
   const size_t ts_sz = ucmp->timestamp_size();
-  autovector<UserKeyRangePtr> ukey_ranges;
+  autovector<UserKeyRangeOpt> ukey_ranges;
   std::vector<std::string> keys;
   std::vector<Slice> key_slices;
   ukey_ranges.reserve(n);
@@ -4862,8 +4895,8 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
     auto [start, limit] = MaybeAddTimestampsToRange(
         ranges[i].start, ranges[i].limit, ts_sz, &keys.emplace_back(),
         &keys.emplace_back(), !include_end);
-    assert((ranges[i].start != nullptr) == start.has_value());
-    assert((ranges[i].limit != nullptr) == limit.has_value());
+    assert(ranges[i].start.has_value() == start.has_value());
+    assert(ranges[i].limit.has_value() == limit.has_value());
     ukey_ranges.emplace_back(start, limit);
   }
 
@@ -5799,6 +5832,27 @@ Status DBImpl::IngestExternalFiles(
             "timestamps enabled doesn't support ingest behind.");
       }
     }
+    if (arg.atomic_replace_range.has_value()) {
+      if (ingest_opts.ingest_behind) {
+        return Status::InvalidArgument(
+            "Can't combine atomic_replace_range with ingest_behind.");
+      }
+      if (ingest_opts.snapshot_consistency) {
+        // TODO: support generating and ingesting a big tombstone file, which
+        // might depend on non-nullptr start and limit
+        return Status::NotSupported(
+            "atomic_replace_range not yet supported with "
+            "snapshot_consistency.");
+      } else {
+        if (arg.atomic_replace_range->start.has_value() ^
+            arg.atomic_replace_range->limit.has_value()) {
+          return Status::NotSupported(
+              "Only one of atomic_replace_range.{start,limit}.has_value() is "
+              "not supported.");
+        }
+      }
+    }
+
     if (ingest_opts.allow_db_generated_files) {
       if (ingest_opts.write_global_seqno) {
         return Status::NotSupported(
@@ -5847,8 +5901,8 @@ Status DBImpl::IngestExternalFiles(
             this);
     Status es = ingestion_jobs[i].Prepare(
         args[i].external_files, args[i].files_checksums,
-        args[i].files_checksum_func_names, args[i].file_temperature,
-        start_file_number, super_version);
+        args[i].files_checksum_func_names, args[i].atomic_replace_range,
+        args[i].file_temperature, start_file_number, super_version);
     // capture first error only
     if (!es.ok() && status.ok()) {
       status = es;
@@ -5863,8 +5917,8 @@ Status DBImpl::IngestExternalFiles(
             this);
     Status es = ingestion_jobs[0].Prepare(
         args[0].external_files, args[0].files_checksums,
-        args[0].files_checksum_func_names, args[0].file_temperature,
-        next_file_number, super_version);
+        args[0].files_checksum_func_names, args[0].atomic_replace_range,
+        args[0].file_temperature, next_file_number, super_version);
     if (!es.ok()) {
       status = es;
     }
@@ -6255,9 +6309,9 @@ Status DBImpl::ClipColumnFamily(ColumnFamilyHandle* column_family,
 
   if (status.ok()) {
     // DeleteFilesInRanges non-overlap files except L0
-    std::vector<RangePtr> ranges;
-    ranges.emplace_back(nullptr, &begin_key);
-    ranges.emplace_back(&end_key, nullptr);
+    std::vector<RangeOpt> ranges;
+    ranges.emplace_back(OptSlice{}, begin_key);
+    ranges.emplace_back(end_key, OptSlice{});
     status = DeleteFilesInRanges(column_family, ranges.data(), ranges.size());
   }
 

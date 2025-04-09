@@ -199,6 +199,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
       immutable_db_options.metadata_write_temperature;
   options.wal_write_temperature = immutable_db_options.wal_write_temperature;
   options.compaction_service = immutable_db_options.compaction_service;
+  options.calculate_sst_write_lifetime_hint_set =
+      immutable_db_options.calculate_sst_write_lifetime_hint_set;
 }
 
 ColumnFamilyOptions BuildColumnFamilyOptions(
@@ -311,8 +313,6 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->compaction_filter_factory = ioptions.compaction_filter_factory;
   cf_opts->min_write_buffer_number_to_merge =
       ioptions.min_write_buffer_number_to_merge;
-  cf_opts->max_write_buffer_number_to_maintain =
-      ioptions.max_write_buffer_number_to_maintain;
   cf_opts->max_write_buffer_size_to_maintain =
       ioptions.max_write_buffer_size_to_maintain;
   cf_opts->inplace_update_support = ioptions.inplace_update_support;

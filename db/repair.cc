@@ -458,8 +458,9 @@ class Repairer {
       meta.file_creation_time = current_time;
       SnapshotChecker* snapshot_checker = DisableGCSnapshotChecker::Instance();
 
-      auto write_hint =
-          cfd->current()->storage_info()->CalculateSSTWriteHint(/*level=*/0);
+      auto write_hint = cfd->current()->storage_info()->CalculateSSTWriteHint(
+          /*level=*/0, db_options_.calculate_sst_write_lifetime_hint_set);
+
       std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
           range_del_iters;
       auto range_del_iter = mem->NewRangeTombstoneIterator(
@@ -577,14 +578,7 @@ class Repairer {
           static_cast<bool>(props->user_defined_timestamps_persisted);
     }
     if (status.ok()) {
-      uint64_t tail_size = 0;
-      bool contain_no_data_blocks =
-          props->num_entries > 0 &&
-          (props->num_entries == props->num_range_deletions);
-      if (props->tail_start_offset > 0 || contain_no_data_blocks) {
-        assert(props->tail_start_offset <= file_size);
-        tail_size = file_size - props->tail_start_offset;
-      }
+      uint64_t tail_size = FileMetaData::CalculateTailSize(file_size, *props);
       t->meta.tail_size = tail_size;
     }
     ColumnFamilyData* cfd = nullptr;

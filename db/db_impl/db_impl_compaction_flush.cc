@@ -981,7 +981,8 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
 
   std::string begin_str, end_str;
   auto [begin, end] =
-      MaybeAddTimestampsToRange(begin_without_ts, end_without_ts, ts_sz,
+      MaybeAddTimestampsToRange(OptSlice::CopyFromPtr(begin_without_ts),
+                                OptSlice::CopyFromPtr(end_without_ts), ts_sz,
                                 &begin_str, &end_str, false /*exclusive_end*/);
 
   return CompactRangeInternal(
@@ -1695,11 +1696,13 @@ void DBImpl::NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
   }
 
   c->SetNotifyOnCompactionCompleted();
+  int num_l0_files = c->input_version()->storage_info()->NumLevelFiles(0);
   // release lock while notifying events
   mutex_.Unlock();
   TEST_SYNC_POINT("DBImpl::NotifyOnCompactionBegin::UnlockMutex");
   {
     CompactionJobInfo info{};
+    info.num_l0_files = num_l0_files;
     BuildCompactionJobInfo(cfd, c, st, job_stats, job_id, &info);
     for (const auto& listener : immutable_db_options_.listeners) {
       listener->OnCompactionBegin(this, info);
@@ -1724,11 +1727,13 @@ void DBImpl::NotifyOnCompactionCompleted(
     return;
   }
 
+  int num_l0_files = cfd->current()->storage_info()->NumLevelFiles(0);
   // release lock while notifying events
   mutex_.Unlock();
   TEST_SYNC_POINT("DBImpl::NotifyOnCompactionCompleted::UnlockMutex");
   {
     CompactionJobInfo info{};
+    info.num_l0_files = num_l0_files;
     BuildCompactionJobInfo(cfd, c, st, compaction_job_stats, job_id, &info);
     for (const auto& listener : immutable_db_options_.listeners) {
       listener->OnCompactionCompleted(this, info);
@@ -3798,6 +3803,8 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     compaction_job_stats.num_input_files = c->num_input_files(0);
     // Trivial moves do not get compacted remotely
     compaction_job_stats.is_remote_compaction = false;
+    compaction_job_stats.num_input_files_trivially_moved =
+        compaction_job_stats.num_input_files;
 
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             compaction_job_stats, job_context->job_id);
