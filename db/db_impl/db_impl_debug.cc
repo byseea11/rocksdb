@@ -84,6 +84,7 @@ void DBImpl::TEST_GetFilesMetaData(
 }
 
 uint64_t DBImpl::TEST_Current_Manifest_FileNo() {
+  InstrumentedMutexLock l(&mutex_);
   return versions_->manifest_file_number();
 }
 
@@ -224,13 +225,13 @@ void DBImpl::TEST_EndWrite(void* w) {
 }
 
 size_t DBImpl::TEST_LogsToFreeSize() {
-  InstrumentedMutexLock l(&log_write_mutex_);
-  return logs_to_free_.size();
+  InstrumentedMutexLock l(&wal_write_mutex_);
+  return wals_to_free_.size();
 }
 
 uint64_t DBImpl::TEST_LogfileNumber() {
   InstrumentedMutexLock l(&mutex_);
-  return logfile_number_;
+  return cur_wal_number_;
 }
 
 void DBImpl::TEST_GetAllBlockCaches(

@@ -31,6 +31,7 @@
 #include "rocksdb/types.h"
 #include "rocksdb/user_write_callback.h"
 #include "rocksdb/utilities/table_properties_collectors.h"
+#include "rocksdb/utilities/write_batch_with_index.h"
 #include "rocksdb/version.h"
 #include "rocksdb/wide_columns.h"
 
@@ -48,6 +49,7 @@ struct CompactRangeOptions;
 struct DBOptions;
 struct ExternalSstFileInfo;
 struct FlushOptions;
+struct FlushWALOptions;
 struct Options;
 struct ReadOptions;
 struct TableProperties;
@@ -56,6 +58,7 @@ struct WaitForCompactOptions;
 class Env;
 class EventListener;
 class FileSystem;
+class MultiScan;
 class Replayer;
 class StatsHistoryIterator;
 class TraceReader;
@@ -94,8 +97,8 @@ class ColumnFamilyHandle {
   virtual const Comparator* GetComparator() const = 0;
 };
 
-static const int kMajorVersion = __ROCKSDB_MAJOR__;
-static const int kMinorVersion = __ROCKSDB_MINOR__;
+static const int kMajorVersion = ROCKSDB_MAJOR;
+static const int kMinorVersion = ROCKSDB_MINOR;
 
 struct GetMergeOperandsOptions {
   using ContinueCallback = std::function<bool(Slice)>;
@@ -350,16 +353,30 @@ class DB {
       std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr);
   // End EXPERIMENTAL
 
-  // Open DB and run the compaction.
-  // It's a read-only operation, the result won't be installed to the DB, it
-  // will be output to the `output_directory`. The API should only be used with
-  // `options.CompactionService` to run compaction triggered by
-  // `CompactionService`.
   static Status OpenAndCompact(
       const std::string& name, const std::string& output_directory,
       const std::string& input, std::string* output,
       const CompactionServiceOptionsOverride& override_options);
 
+  // Opens a database and runs compaction without modifying the original DB.
+  //
+  // This read-only operation outputs compaction results to `output_directory`
+  // instead of installing them back to the source database. Designed primarily
+  // for use with `CompactionService` to process remote compaction jobs.
+  //
+  // Parameters:
+  // - `options`: Additional controls
+  //   * When `allow_resumption = false`: The `output_directory` MUST be empty
+  //     before calling this function. Any existing files (including resume
+  //     state or output files from previous runs) in the directory may
+  //     cause correctness errors as the compaction will start from scratch.
+  // - `name`: Source database path
+  // - `output_directory`: Where compaction output files are written
+  // - `input`: Serialized compaction input information
+  // - `output`: Serialized compaction result
+  // - `override_options`: Configuration overrides for the operation
+  //
+  // Returns: Status of the compaction operation
   static Status OpenAndCompact(
       const OpenAndCompactOptions& options, const std::string& name,
       const std::string& output_directory, const std::string& input,
@@ -631,6 +648,21 @@ class DB {
                                    UserWriteCallback* /*user_write_cb*/) {
     return Status::NotSupported(
         "WriteWithCallback not implemented for this interface.");
+  }
+
+  // EXPERIMENTAL, subject to change
+  // Ingest a WriteBatchWithIndex into DB, bypassing memtable writes for better
+  // write performance. Useful when there is a large number of updates
+  // in the write batch.
+  // The WriteBatchWithIndex must be created with overwrite_key=true.
+  // Currently this requires WriteOptions::disableWAL=true.
+  // The following options are currently not supported:
+  // - unordered_write
+  // - enable_pipelined_write
+  virtual Status IngestWriteBatchWithIndex(
+      const WriteOptions& /*options*/,
+      std::shared_ptr<WriteBatchWithIndex> /*wbwi*/) {
+    return Status::NotSupported("IngestWriteBatchWithIndex not implemented.");
   }
 
   // If the column family specified by "column_family" contains an entry for
@@ -1076,13 +1108,36 @@ class DB {
 
   // Get an iterator that scans multiple key ranges. The scan ranges should
   // be in increasing order of start key. See multi_scan_iterator.h for more
-  // details.
+  // details. For optimal performance, ensure that either all entries in
+  // scan_opts specify the range limit, or none of them do.
+  //
+  // NOTE: iterate_upper_bound in ReadOptions will be ignored. Instead, the
+  // range.limit in ScanOptions is consulted to determine the upper bound key,
+  // if specified.
+  //
+  // Example usage -
+  //  std::vector<ScanOptions> scans{{.start = Slice("bar")},
+  //                              {.start = Slice("foo")}};
+  //  std::unique_ptr<MultiScan> iter.reset(
+  //                                      db->NewMultiScan());
+  //  try {
+  //    for (auto scan : *iter) {
+  //      for (auto it : scan) {
+  //        // Do something with key - it.first
+  //        // Do something with value - it.second
+  //      }
+  //    }
+  //  } catch (MultiScanException& ex) {
+  //    // Check ex.status()
+  //  } catch (std::logic_error& ex) {
+  //    // Check ex.what()
+  //  }
   virtual std::unique_ptr<MultiScan> NewMultiScan(
-      const ReadOptions& /*options*/, ColumnFamilyHandle* /*column_family*/,
-      const std::vector<ScanOptions>& /*scan_opts*/) {
+      const ReadOptions& /*options*/, ColumnFamilyHandle* column_family,
+      const MultiScanArgs& /*scan_opts*/) {
     std::unique_ptr<Iterator> iter(NewErrorIterator(Status::NotSupported()));
-    std::unique_ptr<MultiScan> ms_iter =
-        std::make_unique<MultiScan>(std::move(iter));
+    std::unique_ptr<MultiScan> ms_iter = std::make_unique<MultiScan>(
+        column_family->GetComparator(), std::move(iter));
     return ms_iter;
   }
 
@@ -1737,6 +1792,10 @@ class DB {
     return Status::NotSupported("FlushWAL not implemented");
   }
 
+  virtual Status FlushWAL(const FlushWALOptions& /*options*/) {
+    return Status::NotSupported("FlushWAL not implemented");
+  }
+
   // Ensure all WAL writes have been synced to storage, so that (assuming OS
   // and hardware support) data will survive power loss. This function does
   // not imply FlushWAL, so `FlushWAL(true)` is recommended if using
@@ -1781,6 +1840,25 @@ class DB {
   // Get current full_history_ts value.
   virtual Status GetFullHistoryTsLow(ColumnFamilyHandle* column_family,
                                      std::string* ts_low) = 0;
+
+  // EXPERIMENTAL
+  // Get the newest timestamp of the column family. This is only for when the
+  // column family enables user defined timestamp and when timestamps are not
+  // persisted in SST files, a.k.a `persist_user_defined_timestamps=false`.
+  // This checks the mutable memtable, the immutable memtable and the SST files,
+  // and returns the first newest user defined timestamp found.
+  // When user defined timestamp is not persisted in SST files, metadata in
+  // MANIFEST tracks the most recently seen timestamp for SST files, so the
+  // newest timestamp in SST files can be found.
+  // OK status is returned if finding the newest timestamp succeeds, if
+  // `newest_timestamp` is empty, it means the column family hasn't seen any
+  // timestamp. The returned timestamp is encoded, util method `DecodeU64Ts` can
+  // be used to decode it into uint64_t.
+  // User-defined timestamp is required to be increasing per key, the return
+  // value of this API would be most useful if the user-defined timestamp is
+  // monotonically increasing across keys.
+  virtual Status GetNewestUserDefinedTimestamp(
+      ColumnFamilyHandle* column_family, std::string* newest_timestamp) = 0;
 
   // Suspend deleting obsolete files. Compactions will continue to occur,
   // but no obsolete files will be deleted. To resume file deletions, each
@@ -1893,12 +1971,12 @@ class DB {
   // Retrieve information about the current wal file
   //
   // Note that the log might have rolled after this call in which case
-  // the current_log_file would not point to the current log file.
+  // the current_wal_file would not point to the current log file.
   //
-  // Additionally, for the sake of optimization current_log_file->StartSequence
+  // Additionally, for the sake of optimization current_wal_file->StartSequence
   // would always be set to 0
   virtual Status GetCurrentWalFile(
-      std::unique_ptr<WalFile>* current_log_file) = 0;
+      std::unique_ptr<WalFile>* current_wal_file) = 0;
 
   // IngestExternalFile() will load a list of external SST files (1) into the DB
   // Two primary modes are supported:
@@ -1907,7 +1985,9 @@ class DB {
   // In the first mode we will try to find the lowest possible level that
   // the file can fit in, and ingest the file into this level (2). A file that
   // have a key range that overlap with the memtable key range will require us
-  // to Flush the memtable first before ingesting the file.
+  // to Flush the memtable first before ingesting the file. If ingested files
+  // have any overlap with each other, level and sequence number assignment
+  // ensure later files overwrite earlier files.
   // In the second mode we will always ingest in the bottom most level (see
   // docs to IngestExternalFileOptions::ingest_behind).
   // For a column family that enables user-defined timestamps, ingesting
@@ -1925,7 +2005,7 @@ class DB {
   //     even if the file compression doesn't match the level compression
   // (3) If IngestExternalFileOptions->ingest_behind is set to true,
   //     we always ingest at the bottommost level, which should be reserved
-  //     for this purpose (see DBOPtions::allow_ingest_behind flag).
+  //     for this purpose (see ColumnFamilyOptions::cf_allow_ingest_behind).
   // (4) If IngestExternalFileOptions->fail_if_not_bottommost_level is set to
   //     true, then this method can return Status:TryAgain() indicating that
   //     the files cannot be ingested to the bottommost level, and it is the
@@ -2186,12 +2266,9 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
                                       uint64_t* sizes,
                                       SizeApproximationFlags include_flags) {
   SizeApproximationOptions options;
-  options.include_memtables =
-      ((include_flags & SizeApproximationFlags::INCLUDE_MEMTABLES) !=
-       SizeApproximationFlags::NONE);
-  options.include_files =
-      ((include_flags & SizeApproximationFlags::INCLUDE_FILES) !=
-       SizeApproximationFlags::NONE);
+  using enum SizeApproximationFlags;  // Require C++20 support
+  options.include_memtables = ((include_flags & INCLUDE_MEMTABLES) != NONE);
+  options.include_files = ((include_flags & INCLUDE_FILES) != NONE);
   return GetApproximateSizes(options, column_family, ranges, n, sizes);
 }
 

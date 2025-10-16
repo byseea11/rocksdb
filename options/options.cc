@@ -111,7 +111,10 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       blob_file_starting_level(options.blob_file_starting_level),
       blob_cache(options.blob_cache),
       prepopulate_blob_cache(options.prepopulate_blob_cache),
-      persist_user_defined_timestamps(options.persist_user_defined_timestamps) {
+      persist_user_defined_timestamps(options.persist_user_defined_timestamps),
+      memtable_op_scan_flush_trigger(options.memtable_op_scan_flush_trigger),
+      memtable_avg_op_scan_flush_trigger(
+          options.memtable_avg_op_scan_flush_trigger) {
   assert(memtable_factory.get() != nullptr);
   if (max_bytes_for_level_multiplier_additional.size() <
       static_cast<unsigned int>(num_levels)) {
@@ -284,6 +287,12 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    "      Options.max_sequential_skip_in_iterations: %" PRIu64,
                    max_sequential_skip_in_iterations);
   ROCKS_LOG_HEADER(log,
+                   "         Options.memtable_op_scan_flush_trigger: %" PRIu32,
+                   memtable_op_scan_flush_trigger);
+  ROCKS_LOG_HEADER(log,
+                   "     Options.memtable_avg_op_scan_flush_trigger: %" PRIu32,
+                   memtable_avg_op_scan_flush_trigger);
+  ROCKS_LOG_HEADER(log,
                    "                   Options.max_compaction_bytes: %" PRIu64,
                    max_compaction_bytes);
   ROCKS_LOG_HEADER(
@@ -349,6 +358,9 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    str_compaction_stop_style.c_str());
   ROCKS_LOG_HEADER(log, "Options.compaction_options_universal.max_read_amp: %d",
                    compaction_options_universal.max_read_amp);
+  ROCKS_LOG_HEADER(
+      log, "Options.compaction_options_universal.reduce_file_locking: %d",
+      compaction_options_universal.reduce_file_locking);
   ROCKS_LOG_HEADER(
       log, "Options.compaction_options_fifo.max_table_files_size: %" PRIu64,
       compaction_options_fifo.max_table_files_size);
@@ -450,6 +462,8 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    experimental_mempurge_threshold);
   ROCKS_LOG_HEADER(log, "           Options.memtable_max_range_deletions: %d",
                    memtable_max_range_deletions);
+  ROCKS_LOG_HEADER(log, "                 Options.cf_allow_ingest_behind: %s",
+                   cf_allow_ingest_behind ? "true" : "false");
 }  // ColumnFamilyOptions::Dump
 
 void Options::Dump(Logger* log) const {

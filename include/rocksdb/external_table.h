@@ -8,6 +8,7 @@
 #include "rocksdb/advanced_iterator.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/file_checksum.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/iterator_base.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
@@ -89,7 +90,7 @@ class ExternalTableIterator : public IteratorBase {
   // request that this be called by setting value_prepared to false in
   // IterateResult. Next() should always implicitly materialize the
   // value.
-  virtual bool PrepareValue() = 0;
+  bool PrepareValue() override = 0;
 
   // Return the current key's value
   virtual Slice value() const = 0;
@@ -123,6 +124,17 @@ class ExternalTableReader {
                         const SliceTransform* prefix_extractor,
                         std::vector<std::string>* values,
                         std::vector<Status>* statuses) = 0;
+
+  // Allocate and return the contents of the properties block. If the builder
+  // supports PutPropertiesBlock(), then this must be supported. The
+  // properties block should be written to the table file as is (no
+  // compression or mutation of any kind), and its offset in the file
+  // should be returned in file_offset.
+  virtual Status GetPropertiesBlock(std::unique_ptr<char[]>* /*property_block*/,
+                                    uint64_t* /*size*/,
+                                    uint64_t* /*file_offset*/) {
+    return Status::NotSupported();
+  }
 
   // Return TableProperties for the file. At a minimum, the following
   // properties need to be returned -
@@ -178,6 +190,11 @@ class ExternalTableBuilder {
   // Finish().
   virtual uint64_t FileSize() const = 0;
 
+  // Write the raw properties block as is in the table file
+  virtual Status PutPropertiesBlock(const Slice& /*property_block*/) {
+    return Status::NotSupported();
+  }
+
   //  As mentioned in earlier comments, the following table properties must be
   //  returned at a minimum -
   //  comparator_name
@@ -196,11 +213,17 @@ class ExternalTableBuilder {
 struct ExternalTableOptions {
   const std::shared_ptr<const SliceTransform>& prefix_extractor;
   const Comparator* comparator;
+  const std::shared_ptr<FileSystem>& fs;
+  const FileOptions& file_options;
 
   ExternalTableOptions(
       const std::shared_ptr<const SliceTransform>& _prefix_extractor,
-      const Comparator* _comparator)
-      : prefix_extractor(_prefix_extractor), comparator(_comparator) {}
+      const Comparator* _comparator, const std::shared_ptr<FileSystem>& _fs,
+      const FileOptions& _file_options)
+      : prefix_extractor(_prefix_extractor),
+        comparator(_comparator),
+        fs(_fs),
+        file_options(_file_options) {}
 };
 
 struct ExternalTableBuilderOptions {
@@ -237,14 +260,16 @@ class ExternalTableFactory : public Customizable {
       const ExternalTableOptions& table_options,
       std::unique_ptr<ExternalTableReader>* table_reader) const = 0;
 
+  // The table builder should use the file pointer to append to the file.
+  // Do not sync or close the file after finishing. RocksDB will do that.
   virtual ExternalTableBuilder* NewTableBuilder(
       const ExternalTableBuilderOptions& builder_options,
-      const std::string& file_path) const = 0;
+      const std::string& file_path, FSWritableFile* file) const = 0;
 };
 
 // Allocate a TableFactory that wraps around an ExternalTableFactory. Use this
 // to allocate and set in ColumnFamilyOptions::table_factory.
-std::shared_ptr<TableFactory> NewExternalTableFactory(
+std::unique_ptr<TableFactory> NewExternalTableFactory(
     std::shared_ptr<ExternalTableFactory> inner_factory);
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -74,8 +74,8 @@ Status BuildTable(
     EventLogger* event_logger, int job_id, TableProperties* table_properties,
     Env::WriteLifeTimeHint write_hint, const std::string* full_history_ts_low,
     BlobFileCompletionCallback* blob_callback, Version* version,
-    uint64_t* num_input_entries, uint64_t* memtable_payload_bytes,
-    uint64_t* memtable_garbage_bytes) {
+    uint64_t* memtable_payload_bytes, uint64_t* memtable_garbage_bytes,
+    InternalStats::CompactionStats* flush_stats) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -201,8 +201,7 @@ Status BuildTable(
     CompactionIterator c_iter(
         iter, ucmp, &merge, kMaxSequenceNumber, &snapshots, earliest_snapshot,
         earliest_write_conflict_snapshot, job_snapshot, snapshot_checker, env,
-        ShouldReportDetailedTime(env, ioptions.stats),
-        true /* internal key corruption is not ok */, range_del_agg.get(),
+        ShouldReportDetailedTime(env, ioptions.stats), range_del_agg.get(),
         blob_file_builder.get(), ioptions.allow_data_in_errors,
         ioptions.enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
@@ -218,8 +217,7 @@ Status BuildTable(
       const Slice& key = c_iter.key();
       const Slice& value = c_iter.value();
       ParsedInternalKey ikey = c_iter.ikey();
-      key_after_flush_buf.assign(key.data(), key.size());
-      Slice key_after_flush = key_after_flush_buf;
+      Slice key_after_flush = key;
       Slice value_after_flush = value;
 
       if (ikey.type == kTypeValuePreferredSeqno) {
@@ -237,6 +235,7 @@ Status BuildTable(
               std::min(smallest_preferred_seqno, preferred_seqno);
         } else {
           // Cannot get a useful preferred seqno, convert it to a kTypeValue.
+          key_after_flush_buf.assign(key.data(), key.size());
           UpdateInternalKey(&key_after_flush_buf, ikey.sequence, kTypeValue);
           ikey = ParsedInternalKey(ikey.user_key, ikey.sequence, kTypeValue);
           key_after_flush = key_after_flush_buf;
@@ -252,6 +251,10 @@ Status BuildTable(
         break;
       }
       builder->Add(key_after_flush, value_after_flush);
+
+      if (flush_stats) {
+        flush_stats->num_output_records++;
+      }
 
       s = meta->UpdateBoundaries(key_after_flush, value_after_flush,
                                  ikey.sequence, ikey.type);
@@ -284,6 +287,9 @@ Status BuildTable(
         auto tombstone = range_del_it->Tombstone();
         std::pair<InternalKey, Slice> kv = tombstone.Serialize();
         builder->Add(kv.first.Encode(), kv.second);
+        if (flush_stats) {
+          flush_stats->num_output_records++;
+        }
         InternalKey tombstone_end = tombstone.SerializeEndKey();
         meta->UpdateBoundariesForRange(kv.first, tombstone_end, tombstone.seq_,
                                        tboptions.internal_comparator);
@@ -305,9 +311,9 @@ Status BuildTable(
 
     TEST_SYNC_POINT("BuildTable:BeforeFinishBuildTable");
     const bool empty = builder->IsEmpty();
-    if (num_input_entries != nullptr) {
+    if (flush_stats) {
       assert(c_iter.HasNumInputEntryScanned());
-      *num_input_entries =
+      flush_stats->num_input_records =
           c_iter.NumInputEntryScanned() + num_unfragmented_tombstones;
     }
     if (!s.ok() || empty) {
@@ -334,6 +340,12 @@ Status BuildTable(
     }
 
     if (s.ok() && !empty) {
+      if (flush_stats) {
+        flush_stats->bytes_written_pre_comp = builder->PreCompressionSize();
+        // Add worker CPU micros here. Caller needs to add CPU micros from
+        // calling thread.
+        flush_stats->cpu_micros += builder->GetWorkerCPUMicros();
+      }
       uint64_t file_size = builder->FileSize();
       meta->fd.file_size = file_size;
       meta->tail_size = builder->GetTailSize();

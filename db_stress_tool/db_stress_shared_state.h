@@ -276,6 +276,56 @@ class SharedState {
     return expected_state_manager_->GetPersistedSeqno();
   }
 
+  void EnqueueRemoteCompaction(const std::string& job_id,
+                               const CompactionServiceJobInfo& job_info,
+                               const std::string& serialized_input) {
+    MutexLock l(&remote_compaction_queue_mu_);
+    remote_compaction_queue_.emplace(job_id, job_info, serialized_input);
+  }
+
+  bool DequeueRemoteCompaction(std::string* job_id,
+                               CompactionServiceJobInfo* job_info,
+                               std::string* serialized_input) {
+    assert(job_id);
+    assert(job_info);
+    assert(serialized_input);
+    MutexLock l(&remote_compaction_queue_mu_);
+    if (!remote_compaction_queue_.empty()) {
+      const auto [id, info, input] = remote_compaction_queue_.front();
+      *job_id = id;
+      *job_info = info;
+      *serialized_input = input;
+      remote_compaction_queue_.pop();
+      return true;
+    }
+    return false;
+  }
+
+  void AddRemoteCompactionResult(const std::string& job_id,
+                                 const Status& status,
+                                 const std::string& result) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    remote_compaction_result_map_.emplace(
+        job_id, std::pair<Status, std::string>{status, result});
+  }
+
+  std::optional<Status> GetRemoteCompactionResult(const std::string& job_id,
+                                                  std::string* result) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    if (remote_compaction_result_map_.find(job_id) !=
+        remote_compaction_result_map_.end()) {
+      const auto& pair = remote_compaction_result_map_.at(job_id);
+      *result = pair.second;
+      return pair.first;
+    }
+    return std::nullopt;
+  }
+
+  void RemoveRemoteCompactionResult(const std::string& job_id) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    remote_compaction_result_map_.erase(job_id);
+  }
+
   // Prepare a Put that will be started but not finish yet
   // This is useful for crash-recovery testing when the process may crash
   // before updating the corresponding expected value
@@ -429,6 +479,17 @@ class SharedState {
   StressTest* stress_test_;
   std::atomic<bool> verification_failure_;
   std::atomic<bool> should_stop_test_;
+
+  // Queue for the remote compaction. Tuple of job id, job info and serialized
+  // compaction_service_input
+  port::Mutex remote_compaction_queue_mu_;
+  std::queue<std::tuple<std::string, CompactionServiceJobInfo, std::string>>
+      remote_compaction_queue_;
+  // Result Map for the remote compaciton. Key is the scheduled_job_id and value
+  // is serialized compaction_service_result
+  port::Mutex remote_compaction_result_map_mu_;
+  std::unordered_map<std::string, std::pair<Status, std::string>>
+      remote_compaction_result_map_;
 
   // Keys that should not be overwritten
   const std::unordered_set<int64_t> no_overwrite_ids_;

@@ -333,11 +333,13 @@ bool CompactionPicker::AreFilesInCompaction(
   return false;
 }
 
-Compaction* CompactionPicker::CompactFiles(
+Compaction* CompactionPicker::PickCompactionForCompactFiles(
     const CompactionOptions& compact_options,
     const std::vector<CompactionInputFiles>& input_files, int output_level,
     VersionStorageInfo* vstorage, const MutableCFOptions& mutable_cf_options,
-    const MutableDBOptions& mutable_db_options, uint32_t output_path_id) {
+    const MutableDBOptions& mutable_db_options, uint32_t output_path_id,
+    std::optional<SequenceNumber> earliest_snapshot,
+    const SnapshotChecker* snapshot_checker) {
 #ifndef NDEBUG
   assert(input_files.size());
   // This compaction output should not overlap with a running compaction as
@@ -373,15 +375,16 @@ Compaction* CompactionPicker::CompactFiles(
     // without configurable `CompressionOptions`, which is inconsistent.
     compression_type = compact_options.compression;
   }
+
   auto c = new Compaction(
       vstorage, ioptions_, mutable_cf_options, mutable_db_options, input_files,
       output_level, compact_options.output_file_size_limit,
       mutable_cf_options.max_compaction_bytes, output_path_id, compression_type,
       GetCompressionOptions(mutable_cf_options, vstorage, output_level),
-      mutable_cf_options.default_write_temperature,
+      compact_options.output_temperature_override,
       compact_options.max_subcompactions,
-      /* grandparents */ {}, /* earliest_snapshot */ std::nullopt,
-      /* snapshot_checker */ nullptr, true);
+      /* grandparents */ {}, earliest_snapshot, snapshot_checker,
+      CompactionReason::kManualCompaction);
   RegisterCompaction(c);
   return c;
 }
@@ -601,7 +604,7 @@ void CompactionPicker::GetGrandparents(
   }
 }
 
-Compaction* CompactionPicker::CompactRange(
+Compaction* CompactionPicker::PickCompactionForCompactRange(
     const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
     const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
     int input_level, int output_level,
@@ -617,8 +620,8 @@ Compaction* CompactionPicker::CompactRange(
     // Universal compaction with more than one level always compacts all the
     // files together to the last level.
     assert(vstorage->num_levels() > 1);
-    int max_output_level =
-        vstorage->MaxOutputLevel(ioptions_.allow_ingest_behind);
+    int max_output_level = vstorage->MaxOutputLevel(
+        ioptions_.cf_allow_ingest_behind || ioptions_.allow_ingest_behind);
     // DBImpl::CompactRange() set output level to be the last level
     assert(output_level == max_output_level);
     // DBImpl::RunManualCompaction will make full range for universal compaction
@@ -677,13 +680,11 @@ Compaction* CompactionPicker::CompactRange(
         compact_range_options.target_path_id,
         GetCompressionType(vstorage, mutable_cf_options, output_level, 1),
         GetCompressionOptions(mutable_cf_options, vstorage, output_level),
-        mutable_cf_options.default_write_temperature,
-        compact_range_options.max_subcompactions,
+        Temperature::kUnknown, compact_range_options.max_subcompactions,
         /* grandparents */ {}, /* earliest_snapshot */ std::nullopt,
-        /* snapshot_checker */ nullptr,
-        /* is manual */ true, trim_ts, /* score */ -1,
-        /* deletion_compaction */ false, /* l0_files_might_overlap */ true,
-        CompactionReason::kUnknown,
+        /* snapshot_checker */ nullptr, CompactionReason::kManualCompaction,
+        trim_ts, /* score */ -1,
+        /* l0_files_might_overlap */ true,
         compact_range_options.blob_garbage_collection_policy,
         compact_range_options.blob_garbage_collection_age_cutoff);
 
@@ -870,12 +871,11 @@ Compaction* CompactionPicker::CompactRange(
       GetCompressionType(vstorage, mutable_cf_options, output_level,
                          vstorage->base_level()),
       GetCompressionOptions(mutable_cf_options, vstorage, output_level),
-      mutable_cf_options.default_write_temperature,
-      compact_range_options.max_subcompactions, std::move(grandparents),
+      Temperature::kUnknown, compact_range_options.max_subcompactions,
+      std::move(grandparents),
       /* earliest_snapshot */ std::nullopt, /* snapshot_checker */ nullptr,
-      /* is manual */ true, trim_ts, /* score */ -1,
-      /* deletion_compaction */ false, /* l0_files_might_overlap */ true,
-      CompactionReason::kUnknown,
+      CompactionReason::kManualCompaction, trim_ts, /* score */ -1,
+      /* l0_files_might_overlap */ true,
       compact_range_options.blob_garbage_collection_policy,
       compact_range_options.blob_garbage_collection_age_cutoff);
 
