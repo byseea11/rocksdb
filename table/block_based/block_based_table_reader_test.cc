@@ -1274,13 +1274,13 @@ TEST_P(BlockBasedTableReaderMultiScanAsyncIOTest, MultiScanPrepare) {
                       ExtractUserKey(kv[33 * kEntriesPerBlock].first));
   iter->Prepare(&scan_options);
   iter->Seek(kv[32 * kEntriesPerBlock].first);
+  auto key = iter->key();
   ASSERT_OK(iter->status());
-  iter->Seek(kv[34 * kEntriesPerBlock].first);
-  ASSERT_OK(iter->status());
-  // Seek key could not going backward
   iter->Seek(kv[30 * kEntriesPerBlock].first);
-  ASSERT_EQ(iter->status(),
-            Status::InvalidArgument("Unexpected seek key moving backward"));
+  // When seek key goes backward, it is adjusted to the last seeked position.
+  // Assert the key read is same as before.
+  ASSERT_EQ(key, iter->key());
+  ASSERT_OK(iter->status());
 
   // Test prefetch limit reached.
   iter.reset(table->NewIterator(
@@ -1333,9 +1333,10 @@ TEST_P(BlockBasedTableReaderMultiScanAsyncIOTest, MultiScanPrepare) {
     std::cout << random_seed << std::endl;
     SCOPED_TRACE("Random seed " + std::to_string(random_seed));
 
-    int last_read_key_index = rnd.Uniform(100);
-    while (last_read_key_index < 100) {
-      iter->Seek(kv[last_read_key_index * kEntriesPerBlock].first);
+    // Search key always start from the start key of first prepared range.
+    int last_read_key_index = rnd.Uniform(100) + 5 * kEntriesPerBlock;
+    while (last_read_key_index < 100 * kEntriesPerBlock) {
+      iter->Seek(kv[last_read_key_index].first);
       EXPECT_OK(iter->status());
       // iterate for a few keys
       while (iter->Valid()) {
@@ -1623,6 +1624,91 @@ TEST_P(BlockBasedTableReaderMultiScanTest, MultiScanUnpinPreviousBlocks) {
   }
 }
 
+// Test that fs_prefetch_support flag is correctly initialized during table
+// construction based on filesystem capabilities
+TEST_P(BlockBasedTableReaderTest, FSPrefetchSupportInitializedCorrectly) {
+  class ConfigurablePrefetchFS : public FileSystemWrapper {
+   public:
+    ConfigurablePrefetchFS(const std::shared_ptr<FileSystem>& target,
+                           bool support_prefetch)
+        : FileSystemWrapper(target), support_prefetch_(support_prefetch) {}
+
+    static const char* kClassName() { return "ConfigurablePrefetchFS"; }
+    const char* Name() const override { return kClassName(); }
+
+    void SupportedOps(int64_t& supported_ops) override {
+      target()->SupportedOps(supported_ops);
+      if (!support_prefetch_) {  // Disable prefetch support if requested
+        supported_ops &= ~(1 << FSSupportedOps::kFSPrefetch);
+      }
+    }
+
+   private:
+    bool support_prefetch_;
+  };
+
+  // Prepare test table
+  Options options;
+  options.persist_user_defined_timestamps = persist_udt_;
+  if (udt_enabled_) {
+    options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  }
+  size_t ts_sz = options.comparator->timestamp_size();
+  auto kv = BlockBasedTableReaderBaseTest::GenerateKVMap(5, true, ts_sz);
+  std::string table_name = "BlockBasedTableReaderTest_BlockPrefetcherTest" +
+                           CompressionTypeToString(compression_type_);
+  ImmutableOptions ioptions(options);
+  CreateTable(table_name, ioptions, compression_type_, kv,
+              compression_parallel_threads_, compression_dict_bytes_);
+
+  // Test Case 1: Filesystem supports prefetch, fs_prefetch_support should be
+  // true
+  {
+    auto fs_with_prefetch = std::make_shared<ConfigurablePrefetchFS>(
+        env_->GetFileSystem(), true /* support_prefetch */);
+    std::unique_ptr<Env> env_wrapper(
+        new CompositeEnvWrapper(env_, fs_with_prefetch));
+    options.env = env_wrapper.get();
+
+    FileOptions fopts;
+    fopts.use_direct_reads = use_direct_reads_;
+    InternalKeyComparator cmp(options.comparator);
+    ImmutableOptions iopts(options);
+
+    std::unique_ptr<BlockBasedTable> table;
+    NewBlockBasedTableReader(fopts, iopts, cmp, table_name, &table,
+                             false /* prefetch_index_and_filter_in_cache */,
+                             nullptr, persist_udt_);
+
+    ASSERT_TRUE(table->get_rep()->fs_prefetch_support);
+    ASSERT_TRUE(CheckFSFeatureSupport(fs_with_prefetch.get(),
+                                      FSSupportedOps::kFSPrefetch));
+  }
+
+  // Test Case 2: Filesystem doesn't support prefetch, fs_prefetch_support
+  // should be false
+  {
+    auto fs_without_prefetch = std::make_shared<ConfigurablePrefetchFS>(
+        env_->GetFileSystem(), false /* support_prefetch */);
+    std::unique_ptr<Env> env_wrapper(
+        new CompositeEnvWrapper(env_, fs_without_prefetch));
+    options.env = env_wrapper.get();
+
+    FileOptions fopts;
+    fopts.use_direct_reads = use_direct_reads_;
+    InternalKeyComparator cmp(options.comparator);
+    ImmutableOptions iopts(options);
+
+    std::unique_ptr<BlockBasedTable> table;
+    NewBlockBasedTableReader(fopts, iopts, cmp, table_name, &table,
+                             false /* prefetch_index_and_filter_in_cache */,
+                             nullptr, persist_udt_);
+
+    ASSERT_FALSE(table->get_rep()->fs_prefetch_support);
+    ASSERT_FALSE(CheckFSFeatureSupport(fs_without_prefetch.get(),
+                                       FSSupportedOps::kFSPrefetch));
+  }
+}
 std::vector<BlockBasedTableReaderTestParam> GenerateCombinedParameters(
     const std::vector<CompressionType>& compression_types,
     const std::vector<bool>& use_direct_read_flags,
